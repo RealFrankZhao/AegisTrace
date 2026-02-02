@@ -1,0 +1,60 @@
+# AEGISTRACE
+
+AEGISTRACE is a cross-platform evidence capture system focused on a unified
+bundle format, tamper detection, and independent verification.
+
+## Goals
+
+- Keep the evidence format, hash chain, and verifier consistent across OSes
+- Allow native collectors per platform while sharing Rust core/verifier
+- Provide a minimal GUI shell (optional) for start/stop workflows
+
+## Repository Layout
+
+```
+AEGISTRACE/
+  crates/
+    aegis-core/            # Rust: schema, events, hash chain, bundle writer
+    aegis-verifier/        # Rust: CLI verifier
+    aegis-proto/           # Rust: IPC/message definitions (optional)
+  apps/
+    aegis-tauri/           # Tauri GUI (optional)
+  collectors/
+    macos/                 # Swift: screen/app/input/network (later)
+    windows/               # C# or C++ collectors
+    linux/                 # Rust/C collectors
+  spec/
+    evidence_bundle.md     # Evidence bundle spec (public)
+  scripts/
+    build_macos.sh
+    build_windows.ps1
+    build_linux.sh
+```
+
+## Evidence Bundle (High Level)
+
+```
+Evidence_YYYYMMDD_HHMMSS/
+  session.json
+  events.jsonl
+  manifest.json
+  files/
+    screen.mp4             # optional
+    shots/                 # optional
+```
+
+Minimal `events.jsonl` fields:
+
+- `seq`: increasing sequence number
+- `ts`: UTC timestamp (ISO8601)
+- `type`: event type (e.g. `session_started`, `app_focus_changed`)
+- `payload`: event data (JSON object)
+- `prev_hash` / `hash`: hash chain fields
+
+## Development Plan
+
+See `执行计划` for the step-by-step roadmap and validation checks.
+
+## Technical Guide
+
+See `AEGISTRACE 全栈技术指导` for architecture, IPC strategy, and rollout flow.
