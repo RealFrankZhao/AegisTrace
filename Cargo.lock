@@ -39,6 +39,7 @@ dependencies = [
 name = "aegis-tauri"
 version = "0.1.0"
 dependencies = [
+ "aegis-core",
  "dirs 5.0.1",
  "serde",
  "serde_json",
