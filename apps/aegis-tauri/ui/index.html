@@ -135,8 +135,8 @@
           const addr = document.getElementById("addr").value.trim();
           try {
             const next = await invoke("start_session", {
-              platform,
-              appVersion,
+              platform: platform.length ? platform : null,
+              appVersion: appVersion.length ? appVersion : null,
               saveDir: saveDir.length ? saveDir : null,
               addr: addr.length ? addr : null,
             });

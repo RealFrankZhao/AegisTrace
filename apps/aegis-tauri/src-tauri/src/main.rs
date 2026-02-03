@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -12,7 +12,57 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::State;
 
+#[derive(Deserialize, Clone)]
+struct Config {
+    server: ServerConfig,
+    recording: RecordingConfig,
+    paths: PathsConfig,
+    app: AppConfig,
+}
+
+#[derive(Deserialize, Clone)]
+struct ServerConfig {
+    default_addr: String,
+    stop_wait_ms: u64,
+    stop_retry_count: u32,
+    stop_retry_interval_ms: u64,
+}
+
+#[derive(Deserialize, Clone)]
+struct RecordingConfig {
+    segment_duration_seconds: u64,
+    poll_interval_ms: u64,
+    video: VideoConfig,
+}
+
+#[derive(Deserialize, Clone)]
+struct VideoConfig {
+    codec: String,
+    resolution: ResolutionConfig,
+    fps: u32,
+    bitrate_bps: u64,
+}
+
+#[derive(Deserialize, Clone)]
+struct ResolutionConfig {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Deserialize, Clone)]
+struct PathsConfig {
+    default_save_dir: String,
+    temp_dir: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct AppConfig {
+    platform: String,
+    version: String,
+}
+
 struct AppState {
+    config: Arc<Config>,
     child: Arc<Mutex<Option<Child>>>,
     addr: Arc<Mutex<String>>,
     session_dir: Arc<Mutex<Option<String>>>,
@@ -41,10 +91,59 @@ fn get_status(state: State<AppState>) -> Result<Status, String> {
     })
 }
 
+fn load_config() -> Result<Config, String> {
+    let config_path = find_config_path()?;
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|err| format!("read config {}: {err}", config_path.display()))?;
+    let config: Config = serde_json::from_str(&content)
+        .map_err(|err| format!("parse config: {err}"))?;
+    Ok(config)
+}
+
+fn find_config_path() -> Result<PathBuf, String> {
+    // Try workspace root first
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .and_then(|path| path.parent())
+        .map(PathBuf::from);
+    
+    if let Some(root) = workspace_root {
+        let candidate = root.join("config/config.json");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    
+    // Try current directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("config/config.json");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        let candidate = cwd.join("../config/config.json");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    
+    Err("config/config.json not found".to_string())
+}
+
+fn expand_path(path: &str) -> PathBuf {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&path[2..]);
+        }
+    }
+    PathBuf::from(path)
+}
+
 #[tauri::command]
 fn start_session(
-    platform: String,
-    app_version: String,
+    platform: Option<String>,
+    app_version: Option<String>,
     addr: Option<String>,
     save_dir: Option<String>,
     state: State<AppState>,
@@ -62,16 +161,23 @@ fn start_session(
 
         let _ = stop_recorder_only(&state);
 
-        let addr = addr.unwrap_or_else(|| "127.0.0.1:7878".to_string());
+        let config = state.config.clone();
+        let platform = platform.unwrap_or_else(|| config.app.platform.clone());
+        let app_version = app_version.unwrap_or_else(|| config.app.version.clone());
+        let addr = addr.unwrap_or_else(|| config.server.default_addr.clone());
         *state.addr.lock().map_err(|_| "lock error")? = addr.clone();
         *state.session_dir.lock().map_err(|_| "lock error")? = None;
 
+        let save_dir = if let Some(sd) = save_dir {
+            expand_path(&sd)
+        } else {
+            expand_path(&config.paths.default_save_dir)
+        };
+        
         let core_server = find_core_server()?;
         let mut cmd = Command::new(core_server);
         cmd.arg(&platform).arg(&app_version);
-        if let Some(save_dir) = save_dir {
-            cmd.arg(save_dir);
-        }
+        cmd.arg(save_dir.to_string_lossy().to_string());
         cmd.arg(addr.clone());
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
@@ -102,7 +208,7 @@ fn start_session(
         state
             .recording_active
             .store(true, Ordering::SeqCst);
-        start_recorder_loop(&state, addr.clone())?;
+        start_recorder_loop(&state, addr.clone(), (*state.config).clone())?;
 
         *child_guard = Some(child);
     }
@@ -132,10 +238,11 @@ fn stop_session(reason: Option<String>, state: State<AppState>) -> Result<Status
         }),
     );
 
+    let config = state.config.clone();
     if let Ok(mut child_guard) = state.child.lock() {
         if let Some(mut child) = child_guard.take() {
             if child.try_wait().ok().flatten().is_none() {
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(config.server.stop_wait_ms));
             }
             if child.try_wait().ok().flatten().is_none() {
                 let _ = child.kill();
@@ -154,11 +261,13 @@ fn send_message(addr: &str, payload: serde_json::Value) {
     }
 }
 
-fn start_recorder_loop(state: &State<AppState>, addr: String) -> Result<(), String> {
+fn start_recorder_loop(state: &State<AppState>, addr: String, config: Config) -> Result<(), String> {
     let recorder_path = find_native_recorder()?;
     let recording_active = state.recording_active.clone();
     let recorder_state = state.recorder.clone();
     let recorder_output = state.recorder_output.clone();
+    let segment_duration = config.recording.segment_duration_seconds;
+    let poll_interval = config.recording.poll_interval_ms;
 
     let handle = thread::spawn(move || {
         let mut segment_index: u64 = 1;
@@ -167,13 +276,18 @@ fn start_recorder_loop(state: &State<AppState>, addr: String) -> Result<(), Stri
                 .duration_since(UNIX_EPOCH)
                 .map(|value| value.as_secs())
                 .unwrap_or(0);
+            let temp_dir = if let Some(ref td) = config.paths.temp_dir {
+                expand_path(td)
+            } else {
+                std::env::temp_dir()
+            };
             let output_path =
-                std::env::temp_dir().join(format!("aegis_screen_{segment_index}_{timestamp}.mov"));
+                temp_dir.join(format!("aegis_screen_{segment_index}_{timestamp}.mov"));
             let _ = std::fs::remove_file(&output_path);
 
             let mut cmd = Command::new(&recorder_path);
             cmd.arg(output_path.to_string_lossy().to_string())
-                .arg("600");
+                .arg(segment_duration.to_string());
             cmd.stdin(Stdio::piped());
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
@@ -207,10 +321,10 @@ fn start_recorder_loop(state: &State<AppState>, addr: String) -> Result<(), Stri
                     break;
                 }
                 if !recording_active.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(Duration::from_millis(poll_interval));
                     continue;
                 }
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(poll_interval));
             }
 
             if let Ok(mut guard) = recorder_state.lock() {
@@ -251,16 +365,17 @@ fn start_recorder_loop(state: &State<AppState>, addr: String) -> Result<(), Stri
 }
 
 fn stop_recorder_only(state: &State<AppState>) -> Result<(), String> {
+    let config = state.config.clone();
     let mut recorder_guard = state.recorder.lock().map_err(|_| "lock error")?;
     if let Some(mut recorder) = recorder_guard.take() {
         if let Some(mut stdin) = recorder.stdin.take() {
             let _ = stdin.write_all(b"\n");
         }
-        for _ in 0..10 {
+        for _ in 0..config.server.stop_retry_count {
             if recorder.try_wait().ok().flatten().is_some() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(config.server.stop_retry_interval_ms));
         }
         if recorder.try_wait().ok().flatten().is_none() {
             let _ = recorder.kill();
@@ -368,10 +483,14 @@ fn find_native_recorder() -> Result<PathBuf, String> {
 }
 
 fn main() {
+    let config = load_config().expect("Failed to load config");
+    let default_addr = config.server.default_addr.clone();
+    
     tauri::Builder::default()
         .manage(AppState {
+            config: Arc::new(config),
             child: Arc::new(Mutex::new(None)),
-            addr: Arc::new(Mutex::new("127.0.0.1:7878".to_string())),
+            addr: Arc::new(Mutex::new(default_addr)),
             session_dir: Arc::new(Mutex::new(None)),
             recorder: Arc::new(Mutex::new(None)),
             recorder_output: Arc::new(Mutex::new(None)),

@@ -1,0 +1,29 @@
+{
+  "server": {
+    "default_addr": "127.0.0.1:7878",
+    "stop_wait_ms": 300,
+    "stop_retry_count": 10,
+    "stop_retry_interval_ms": 200
+  },
+  "recording": {
+    "segment_duration_seconds": 600,
+    "poll_interval_ms": 200,
+    "video": {
+      "codec": "hevc",
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "fps": 30,
+      "bitrate_bps": 2000000
+    }
+  },
+  "paths": {
+    "default_save_dir": "~/Downloads",
+    "temp_dir": null
+  },
+  "app": {
+    "platform": "macos",
+    "version": "0.1.0"
+  }
+}
